@@ -1,0 +1,13 @@
+I have 8 jobs and 3 machines. Each machine is available at time 0.
+
+Job J1 arrives at 0, processing time 5, due date 14, priority 2.
+Job J2 arrives at 1, processing time 9, due date 22, priority 1.
+Job J3 arrives at 3, processing time 4, due date 10, priority 3.
+Job J4 arrives at 5, processing time 6, due date 18, priority 2.
+Job J5 arrives at 6, processing time 3, due date 15, priority 1.
+Job J6 arrives at 8, processing time 7, due date 25, priority 3.
+Job J7 arrives at 9, processing time 2, due date 13, priority 2.
+Job J8 arrives at 12, processing time 8, due date 28, priority 1.
+
+Compare FCFS, SPT, EDD, and PRIORITY.
+Recommend a scheduling rule and explain the trade-offs among lateness, flow time, makespan, and utilization.

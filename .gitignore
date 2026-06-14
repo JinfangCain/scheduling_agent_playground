@@ -3,3 +3,6 @@ __pycache__/
 .DS_Store
 .venv/
 venv/
+.env
+.streamlit/secrets.toml
+outputs/agent_runs/

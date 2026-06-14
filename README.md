@@ -57,7 +57,43 @@ python scripts/04_agent_explain_results.py
 
 The Ollama script uses `http://localhost:11434/api/generate` and does not send data to an external API. It is optional; the scheduling playground works without any LLM.
 
+## Agent-Style Natural Language Demo
+
+The first agent-style interface reads a natural-language request, extracts jobs and machines, validates the structured data, runs the same transparent dispatching rules, and writes a run-specific audit folder.
+
+Local chatbot-style app:
+
+```bash
+streamlit run app.py
+```
+
+Deterministic demo without Ollama:
+
+```bash
+python scripts/05_agent_run_request.py examples/demo_request.txt --no-ollama
+```
+
+Local Ollama-assisted demo:
+
+```bash
+python scripts/05_agent_run_request.py examples/demo_request.txt
+```
+
+Each run writes outputs under `outputs/agent_runs/`, including the original request, parsed JSON, job and machine CSVs, schedule CSVs, an Excel comparison workbook, a markdown comparison report, a Gantt chart, and a natural-language summary.
+
+## Streamlit Cloud Deployment
+
+This repo is prepared for Streamlit Community Cloud:
+
+- app entry point: `app.py`
+- Python dependencies: `requirements.txt`
+- Streamlit config: `.streamlit/config.toml`
+- generated agent runs are ignored by Git: `outputs/agent_runs/`
+
+For the first public demo, keep `Use local Ollama` off. Local Ollama points to `localhost`, which only works on the machine running Ollama. A future OpenAI-backed mode should read `OPENAI_API_KEY` from Streamlit secrets or the environment, never from committed source files.
+
+In Streamlit Community Cloud, add secrets in the app settings using the shape shown in `.streamlit/secrets.example.toml`.
+
 ## Design Principle
 
 The scheduling algorithm remains transparent and rule-based. The LLM, when used, is only an explanation and research-assistant layer. It should help interpret results, suggest next experiments, and identify bottlenecks, but it should not silently decide the schedule.
-
