@@ -7,7 +7,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 import requests
@@ -619,15 +619,22 @@ def run_agent_text(
     openai_api_key: str | None = None,
     openai_model: str = OPENAI_MODEL,
     openai_responses_url: str = OPENAI_RESPONSES_URL,
+    progress_callback: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any]:
+    def emit(step: str, message: str) -> None:
+        if progress_callback:
+            progress_callback(step, message)
+
     parser_used = "fallback_regex"
     parser_error = None
     provider = provider.lower()
     if use_ollama:
         provider = "ollama"
 
+    emit("Understand request", f"Reading natural-language request with provider '{provider}'.")
     if provider == "openai":
         try:
+            emit("Parse request", f"Sending request to OpenAI model {openai_model} for structured extraction.")
             parsed = ask_openai_for_json(
                 request_text=request_text,
                 model=openai_model,
@@ -635,22 +642,32 @@ def run_agent_text(
                 responses_url=openai_responses_url,
             )
             parser_used = f"openai:{openai_model}"
+            emit("Parse request", "OpenAI returned structured scheduling data.")
         except Exception as exc:
             parser_error = str(exc)
+            emit("Parse request", f"OpenAI parsing failed; using deterministic fallback. Reason: {parser_error}")
             parsed = fallback_parse_request(request_text)
     elif provider == "ollama":
         try:
+            emit("Parse request", f"Sending request to local Ollama model {model}.")
             parsed = ask_ollama_for_json(request_text, model, ollama_url)
             parser_used = f"ollama:{model}"
+            emit("Parse request", "Ollama returned structured scheduling data.")
         except Exception as exc:
             parser_error = str(exc)
+            emit("Parse request", f"Ollama parsing failed; using deterministic fallback. Reason: {parser_error}")
             parsed = fallback_parse_request(request_text)
     elif provider == "deterministic":
+        emit("Parse request", "Using deterministic parser to extract jobs, machines, and rules.")
         parsed = fallback_parse_request(request_text)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
     request = normalize_and_validate(parsed)
+    emit(
+        "Validate input",
+        f"Validated {len(request['jobs'])} jobs, {len(request['machines'])} machines, and rules {', '.join(request['rules'])}.",
+    )
     run_dir = next_run_dir(run_stem)
     schedule_dir = run_dir / "schedules"
     chart_dir = run_dir / "charts"
@@ -677,14 +694,17 @@ def run_agent_text(
     machines.to_csv(run_dir / "machines.csv", index=False)
 
     schedules = []
+    emit("Run dispatching rules", f"Running {', '.join(request['rules'])}.")
     for rule in request["rules"]:
         schedule = dispatch.schedule_jobs(jobs, machines, rule)
         schedule.to_csv(schedule_dir / f"schedule_{rule.lower()}.csv", index=False)
         schedules.append(schedule)
+        emit("Run dispatching rules", f"Finished {rule}.")
 
     summary = pd.DataFrame([compare.summarize_schedule(schedule) for schedule in schedules])
     summary = summary.sort_values(["total_lateness", "makespan", "average_flow_time", "rule"])
     best_rule = summary.iloc[0]["rule"]
+    emit("Compare objectives", f"{best_rule} is leading by total lateness, then makespan.")
 
     comparison_path = run_dir / "schedule_comparison.xlsx"
     with pd.ExcelWriter(comparison_path, engine="openpyxl") as writer:
@@ -700,12 +720,14 @@ def run_agent_text(
 
     diagnostics = build_diagnostics(best_schedule, summary, best_rule)
     agent_trace = build_agent_trace(request, parser_used, parser_error, summary, best_rule, diagnostics)
+    emit("Inspect schedule structure", diagnostics["headline"])
     (run_dir / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2) + "\n", encoding="utf-8")
     (run_dir / "agent_trace.json").write_text(json.dumps(agent_trace, indent=2) + "\n", encoding="utf-8")
 
     report_text = report_path.read_text(encoding="utf-8")
     if provider == "openai":
         try:
+            emit("Generate explanation", f"Sending metrics, trace, and diagnostics to OpenAI model {openai_model}.")
             nl_summary = ask_openai_for_summary(
                 summary=summary,
                 report_text=report_text,
@@ -715,18 +737,25 @@ def run_agent_text(
                 api_key=openai_api_key or os.environ.get("OPENAI_API_KEY", ""),
                 responses_url=openai_responses_url,
             )
+            emit("Generate explanation", "OpenAI generated the scheduling-agent report.")
         except Exception as exc:
+            emit("Generate explanation", f"OpenAI explanation failed; using deterministic summary. Reason: {exc}")
             nl_summary = deterministic_summary(summary, request["objective"], diagnostics)
             nl_summary += f"\n_OpenAI summary unavailable: `{exc}`._\n"
     elif provider == "ollama":
         try:
+            emit("Generate explanation", f"Sending metrics, trace, and diagnostics to local Ollama model {model}.")
             nl_summary = ask_ollama_for_summary(summary, report_text, diagnostics, agent_trace, model, ollama_url)
+            emit("Generate explanation", "Ollama generated the scheduling-agent report.")
         except Exception as exc:
+            emit("Generate explanation", f"Ollama explanation failed; using deterministic summary. Reason: {exc}")
             nl_summary = deterministic_summary(summary, request["objective"], diagnostics)
             nl_summary += f"\n_Ollama summary unavailable: `{exc}`._\n"
     else:
+        emit("Generate explanation", "Using deterministic summary generator.")
         nl_summary = deterministic_summary(summary, request["objective"], diagnostics)
     (run_dir / "nl_summary.md").write_text(nl_summary, encoding="utf-8")
+    emit("Save outputs", f"Saved comparison, trace, diagnostics, chart, and summary to {run_dir}.")
 
     print(f"Parsed {len(jobs)} jobs and {len(machines)} machines.")
     print(f"Parser used: {parser_used}")

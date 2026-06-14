@@ -72,6 +72,7 @@ def run_request(
     openai_model: str,
     ollama_model: str,
     ollama_url: str,
+    progress_callback: Any | None = None,
 ) -> dict[str, Any]:
     return agent.run_agent_text(
         request_text=request_text,
@@ -81,6 +82,7 @@ def run_request(
         openai_model=openai_model,
         model=ollama_model,
         ollama_url=ollama_url,
+        progress_callback=progress_callback,
     )
 
 
@@ -96,6 +98,15 @@ def assistant_error_message(exc: Exception) -> str:
     if "missing required fields" in text:
         return f"I found an incomplete record: {text}. Please add the missing value and run again."
     return f"I could not run the scheduling request yet: {text}"
+
+
+def trace_markdown(trace: list[dict[str, str]]) -> str:
+    if not trace:
+        return ""
+    lines = ["\n\n**Visible agent trace**"]
+    for item in trace:
+        lines.append(f"- **{item['step']}**: {item['message']}")
+    return "\n".join(lines)
 
 
 def render_result(result: dict[str, Any]) -> None:
@@ -245,12 +256,13 @@ def main() -> None:
                 st.markdown(message["content"])
 
         prompt = st.chat_input("Ask or paste a scheduling request")
+        submitted_request = None
         if prompt:
-            st.session_state.request_text = prompt
+            submitted_request = prompt
             run_clicked = True
 
     if run_clicked:
-        request_text = st.session_state.request_text.strip()
+        request_text = (submitted_request if submitted_request is not None else st.session_state.request_text).strip()
         if not request_text:
             st.session_state.messages.append(
                 {"role": "assistant", "content": "Please enter a scheduling request first."}
@@ -258,14 +270,28 @@ def main() -> None:
         else:
             st.session_state.messages.append({"role": "user", "content": request_text})
             try:
-                with st.spinner("Parsing, scheduling, comparing, and saving outputs..."):
-                    result = run_request(request_text, provider, openai_model, ollama_model, ollama_url)
+                with st.status("Agent is working through the scheduling request...", expanded=True) as status:
+                    status.write("Starting visible agent trace.")
+
+                    def show_progress(step: str, message: str) -> None:
+                        status.write(f"**{step}**: {message}")
+
+                    result = run_request(
+                        request_text,
+                        provider,
+                        openai_model,
+                        ollama_model,
+                        ollama_url,
+                        progress_callback=show_progress,
+                    )
+                    status.update(label="Agent trace complete.", state="complete", expanded=True)
                 st.session_state.last_result = result
                 reply = (
                     f"I parsed {len(result['jobs'])} jobs and {len(result['machines'])} machines, "
                     f"compared {', '.join(result['request']['rules'])}, and recommend "
                     f"**{result['best_rule']}** by total lateness, then makespan. "
                     f"Results were saved to `{display_path(Path(result['run_dir']))}`."
+                    f"{trace_markdown(result.get('agent_trace', []))}"
                 )
                 st.session_state.messages.append({"role": "assistant", "content": reply})
             except Exception as exc:
