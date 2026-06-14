@@ -325,6 +325,8 @@ def deterministic_summary(summary: pd.DataFrame, objective: str) -> str:
     lines.extend(
         [
             "",
+            "Visualization: the app displays a Gantt chart for the recommended rule below the comparison table. Use it to inspect machine assignment, job order, idle time, and whether any jobs are late.",
+            "",
             "This is a transparent rule-based recommendation. It should be treated as a baseline experiment, not a final production scheduler.",
         ]
     )
@@ -338,6 +340,8 @@ You are a local scheduling research assistant.
 Explain this scheduling run in concise markdown for a collaborator demo.
 Focus on the recommended rule, trade-offs, and limitations.
 Do not claim this is a real factory scheduler.
+The app displays a Gantt chart for the recommended rule below the comparison table.
+Do not say that Gantt charts or visualizations are not included.
 
 Summary:
 {summary.to_csv(index=False)}
@@ -358,6 +362,10 @@ You are a scheduling research assistant.
 Explain this scheduling run in concise markdown for a collaborator demo.
 Focus on the recommended rule, trade-offs, and limitations.
 Do not claim this is a real factory scheduler.
+The app displays a Gantt chart for the recommended rule below the comparison table.
+Do not say that Gantt charts or visualizations are not included.
+If you mention the Gantt chart, explain that it shows machine assignment over time,
+job order, idle gaps, and late jobs if any appear.
 
 Summary:
 {summary.to_csv(index=False)}
