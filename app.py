@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,14 @@ def read_bytes(path: Path) -> bytes:
     return path.read_bytes()
 
 
+def get_secret(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(name, default)
+    except Exception:
+        value = default
+    return str(value or os.environ.get(name, default) or default)
+
+
 def display_path(path: Path) -> str:
     try:
         return str(path.resolve().relative_to(BASE_DIR))
@@ -57,12 +66,20 @@ def initialize_state() -> None:
         st.session_state.last_result = None
 
 
-def run_request(request_text: str, use_ollama: bool, model: str, ollama_url: str) -> dict[str, Any]:
+def run_request(
+    request_text: str,
+    provider: str,
+    openai_model: str,
+    ollama_model: str,
+    ollama_url: str,
+) -> dict[str, Any]:
     return agent.run_agent_text(
         request_text=request_text,
         run_stem="streamlit_request",
-        use_ollama=use_ollama,
-        model=model,
+        provider=provider,
+        openai_api_key=get_secret("OPENAI_API_KEY"),
+        openai_model=openai_model,
+        model=ollama_model,
         ollama_url=ollama_url,
     )
 
@@ -148,9 +165,23 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Agent Settings")
-        use_ollama = st.toggle("Use local Ollama", value=False)
-        model = st.text_input("Model", value=agent.MODEL)
+        provider_labels = {
+            "openai": "OpenAI",
+            "deterministic": "Deterministic fallback",
+            "ollama": "Local Ollama",
+        }
+        provider_label = st.selectbox(
+            "Provider",
+            list(provider_labels.values()),
+            index=0,
+            help="OpenAI uses Streamlit secrets. Deterministic fallback needs no API key.",
+        )
+        provider = next(key for key, value in provider_labels.items() if value == provider_label)
+        openai_model = st.text_input("OpenAI model", value=get_secret("OPENAI_MODEL", agent.OPENAI_MODEL))
+        ollama_model = st.text_input("Ollama model", value=agent.MODEL)
         ollama_url = st.text_input("Ollama URL", value=agent.OLLAMA_URL)
+        if provider == "openai" and not get_secret("OPENAI_API_KEY"):
+            st.warning("OPENAI_API_KEY is not configured. The app will fall back to deterministic parsing.")
         st.divider()
         if st.button("Load Demo Request", width="stretch"):
             st.session_state.request_text = read_text(DEMO_REQUEST_PATH)
@@ -190,7 +221,7 @@ def main() -> None:
             st.session_state.messages.append({"role": "user", "content": request_text})
             try:
                 with st.spinner("Parsing, scheduling, comparing, and saving outputs..."):
-                    result = run_request(request_text, use_ollama, model, ollama_url)
+                    result = run_request(request_text, provider, openai_model, ollama_model, ollama_url)
                 st.session_state.last_result = result
                 reply = (
                     f"I parsed {len(result['jobs'])} jobs and {len(result['machines'])} machines, "

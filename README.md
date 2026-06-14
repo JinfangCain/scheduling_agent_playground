@@ -90,9 +90,16 @@ This repo is prepared for Streamlit Community Cloud:
 - Streamlit config: `.streamlit/config.toml`
 - generated agent runs are ignored by Git: `outputs/agent_runs/`
 
-For the first public demo, keep `Use local Ollama` off. Local Ollama points to `localhost`, which only works on the machine running Ollama. A future OpenAI-backed mode should read `OPENAI_API_KEY` from Streamlit secrets or the environment, never from committed source files.
+For the public demo, the app defaults to OpenAI when `OPENAI_API_KEY` is configured in Streamlit secrets. If OpenAI parsing or summarization fails, the app falls back to deterministic parsing and summary generation so the demo still runs.
 
-In Streamlit Community Cloud, add secrets in the app settings using the shape shown in `.streamlit/secrets.example.toml`.
+Local Ollama remains available as an optional provider, but it points to `localhost`, which only works on the machine running Ollama.
+
+In Streamlit Community Cloud, add secrets in the app settings using the shape shown in `.streamlit/secrets.example.toml`:
+
+```toml
+OPENAI_API_KEY = "your_real_key_here"
+OPENAI_MODEL = "gpt-4.1-mini"
+```
 
 ## Design Principle
 

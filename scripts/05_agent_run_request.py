@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,8 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 AGENT_RUNS_DIR = OUTPUT_DIR / "agent_runs"
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "llama3.1:8b"
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+OPENAI_MODEL = "gpt-4.1-mini"
 KNOWN_RULES = ["FCFS", "SPT", "EDD", "PRIORITY"]
 
 
@@ -75,6 +78,60 @@ def ask_ollama_for_json(request_text: str, model: str, ollama_url: str) -> dict[
     response.raise_for_status()
     raw_text = response.json().get("response", "").strip()
     return json.loads(raw_text)
+
+
+def extract_response_text(data: dict[str, Any]) -> str:
+    if data.get("output_text"):
+        return str(data["output_text"])
+
+    chunks = []
+    for item in data.get("output", []):
+        for content in item.get("content", []):
+            if "text" in content:
+                chunks.append(str(content["text"]))
+            elif "output_text" in content:
+                chunks.append(str(content["output_text"]))
+    return "\n".join(chunks).strip()
+
+
+def parse_json_object(text: str) -> dict[str, Any]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
+def ask_openai_for_json(
+    request_text: str,
+    model: str,
+    api_key: str,
+    responses_url: str = OPENAI_RESPONSES_URL,
+) -> dict[str, Any]:
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not configured.")
+
+    response = requests.post(
+        responses_url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "input": build_extraction_prompt(request_text),
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    raw_text = extract_response_text(response.json())
+    return parse_json_object(raw_text)
 
 
 def fallback_parse_request(request_text: str) -> dict[str, Any]:
@@ -294,25 +351,88 @@ Report:
     return response.json().get("response", "").strip() + "\n"
 
 
+def build_summary_prompt(summary: pd.DataFrame, report_text: str) -> str:
+    return f"""
+You are a scheduling research assistant.
+
+Explain this scheduling run in concise markdown for a collaborator demo.
+Focus on the recommended rule, trade-offs, and limitations.
+Do not claim this is a real factory scheduler.
+
+Summary:
+{summary.to_csv(index=False)}
+
+Report:
+{report_text}
+""".strip()
+
+
+def ask_openai_for_summary(
+    summary: pd.DataFrame,
+    report_text: str,
+    model: str,
+    api_key: str,
+    responses_url: str = OPENAI_RESPONSES_URL,
+) -> str:
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not configured.")
+
+    response = requests.post(
+        responses_url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "input": build_summary_prompt(summary, report_text),
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    return extract_response_text(response.json()).strip() + "\n"
+
+
 def run_agent_text(
     request_text: str,
     run_stem: str,
-    use_ollama: bool,
-    model: str,
-    ollama_url: str,
+    use_ollama: bool = False,
+    model: str = MODEL,
+    ollama_url: str = OLLAMA_URL,
+    provider: str = "deterministic",
+    openai_api_key: str | None = None,
+    openai_model: str = OPENAI_MODEL,
+    openai_responses_url: str = OPENAI_RESPONSES_URL,
 ) -> dict[str, Any]:
     parser_used = "fallback_regex"
     parser_error = None
-
+    provider = provider.lower()
     if use_ollama:
+        provider = "ollama"
+
+    if provider == "openai":
+        try:
+            parsed = ask_openai_for_json(
+                request_text=request_text,
+                model=openai_model,
+                api_key=openai_api_key or os.environ.get("OPENAI_API_KEY", ""),
+                responses_url=openai_responses_url,
+            )
+            parser_used = f"openai:{openai_model}"
+        except Exception as exc:
+            parser_error = str(exc)
+            parsed = fallback_parse_request(request_text)
+    elif provider == "ollama":
         try:
             parsed = ask_ollama_for_json(request_text, model, ollama_url)
             parser_used = f"ollama:{model}"
         except Exception as exc:
             parser_error = str(exc)
             parsed = fallback_parse_request(request_text)
-    else:
+    elif provider == "deterministic":
         parsed = fallback_parse_request(request_text)
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
 
     request = normalize_and_validate(parsed)
     run_dir = next_run_dir(run_stem)
@@ -363,7 +483,19 @@ def run_agent_text(
     write_agent_report(summary, best_rule, chart_path, report_path)
 
     report_text = report_path.read_text(encoding="utf-8")
-    if use_ollama:
+    if provider == "openai":
+        try:
+            nl_summary = ask_openai_for_summary(
+                summary=summary,
+                report_text=report_text,
+                model=openai_model,
+                api_key=openai_api_key or os.environ.get("OPENAI_API_KEY", ""),
+                responses_url=openai_responses_url,
+            )
+        except Exception as exc:
+            nl_summary = deterministic_summary(summary, request["objective"])
+            nl_summary += f"\n_OpenAI summary unavailable: `{exc}`._\n"
+    elif provider == "ollama":
         try:
             nl_summary = ask_ollama_for_summary(summary, report_text, model, ollama_url)
         except Exception as exc:
@@ -393,6 +525,7 @@ def run_agent_text(
         "comparison_path": comparison_path,
         "parser_used": parser_used,
         "parser_error": parser_error,
+        "provider": provider,
     }
 
 
@@ -401,6 +534,9 @@ def run_agent_request(
     use_ollama: bool,
     model: str,
     ollama_url: str,
+    provider: str = "deterministic",
+    openai_api_key: str | None = None,
+    openai_model: str = OPENAI_MODEL,
 ) -> Path:
     result = run_agent_text(
         request_text=request_path.read_text(encoding="utf-8"),
@@ -408,6 +544,9 @@ def run_agent_request(
         use_ollama=use_ollama,
         model=model,
         ollama_url=ollama_url,
+        provider=provider,
+        openai_api_key=openai_api_key,
+        openai_model=openai_model,
     )
     run_dir = result["run_dir"]
     return run_dir
@@ -416,9 +555,16 @@ def run_agent_request(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run an agent-style scheduling request from natural language.")
     parser.add_argument("request_path", type=Path, help="Text file containing the natural-language scheduling request.")
-    parser.add_argument("--no-ollama", action="store_true", help="Use the deterministic parser and summary only.")
+    parser.add_argument(
+        "--provider",
+        choices=["deterministic", "openai", "ollama"],
+        default="deterministic",
+        help="LLM provider for parsing and summary. Falls back to deterministic parsing on provider failure.",
+    )
+    parser.add_argument("--no-ollama", action="store_true", help="Deprecated alias for --provider deterministic.")
     parser.add_argument("--model", default=MODEL, help="Local Ollama model name.")
     parser.add_argument("--ollama-url", default=OLLAMA_URL, help="Local Ollama generate endpoint.")
+    parser.add_argument("--openai-model", default=OPENAI_MODEL, help="OpenAI model name.")
     args = parser.parse_args()
 
     if not args.request_path.exists():
@@ -426,9 +572,11 @@ def main() -> None:
 
     run_agent_request(
         request_path=args.request_path,
-        use_ollama=not args.no_ollama,
+        use_ollama=False if args.no_ollama else args.provider == "ollama",
         model=args.model,
         ollama_url=args.ollama_url,
+        provider="deterministic" if args.no_ollama else args.provider,
+        openai_model=args.openai_model,
     )
 
 
