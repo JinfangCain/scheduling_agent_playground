@@ -117,6 +117,29 @@ def render_result(result: dict[str, Any]) -> None:
     col2.metric("Jobs", str(len(result["jobs"])))
     col3.metric("Machines", str(len(result["machines"])))
 
+    st.subheader("Agent Trace")
+    for item in result.get("agent_trace", []):
+        st.markdown(f"**{item['step']}**: {item['message']}")
+
+    diagnostics = result.get("diagnostics", {})
+    if diagnostics:
+        st.subheader("Schedule Diagnostics")
+        st.caption(diagnostics.get("headline", ""))
+        diag_col1, diag_col2 = st.columns(2)
+        busiest = diagnostics.get("busiest_machine", {})
+        most_idle = diagnostics.get("most_idle_machine", {})
+        if busiest:
+            diag_col1.metric("Busiest Machine", str(busiest.get("machine_id", "")), f"{busiest.get('busy_time', 0)} busy time")
+        if most_idle:
+            diag_col2.metric("Most Idle Machine", str(most_idle.get("machine_id", "")), f"{most_idle.get('idle_time', 0)} idle time")
+        with st.expander("Machine-level details", expanded=False):
+            st.dataframe(pd.DataFrame(diagnostics.get("machine_diagnostics", [])), width="stretch", hide_index=True)
+        with st.expander("Longest-flow jobs and idle gaps", expanded=False):
+            st.write("Longest-flow jobs")
+            st.dataframe(pd.DataFrame(diagnostics.get("longest_flow_jobs", [])), width="stretch", hide_index=True)
+            st.write("Largest idle gaps")
+            st.dataframe(pd.DataFrame(diagnostics.get("top_idle_gaps", [])), width="stretch", hide_index=True)
+
     st.subheader("Parsed Request")
     with st.expander("Jobs and machines", expanded=False):
         st.caption(f"Parser used: {result['parser_used']}")
@@ -155,6 +178,21 @@ def render_result(result: dict[str, Any]) -> None:
         file_name="nl_summary.md",
         mime="text/markdown",
     )
+
+    if result.get("agent_trace_path") and result.get("diagnostics_path"):
+        extra_cols = st.columns(2)
+        extra_cols[0].download_button(
+            "Download Trace",
+            data=read_text(Path(result["agent_trace_path"])),
+            file_name="agent_trace.json",
+            mime="application/json",
+        )
+        extra_cols[1].download_button(
+            "Download Diagnostics",
+            data=read_text(Path(result["diagnostics_path"])),
+            file_name="diagnostics.json",
+            mime="application/json",
+        )
 
 
 def main() -> None:

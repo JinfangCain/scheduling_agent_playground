@@ -300,7 +300,138 @@ def write_agent_report(summary: pd.DataFrame, best_rule: str, chart_path: str, o
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def deterministic_summary(summary: pd.DataFrame, objective: str) -> str:
+def build_agent_trace(
+    request: dict[str, Any],
+    parser_used: str,
+    parser_error: str | None,
+    summary: pd.DataFrame,
+    best_rule: str,
+    diagnostics: dict[str, Any],
+) -> list[dict[str, str]]:
+    best = summary.iloc[0]
+    trace = [
+        {
+            "step": "Understand request",
+            "status": "done",
+            "message": f"Parsed {len(request['jobs'])} jobs, {len(request['machines'])} machines, and objective '{request['objective']}'.",
+        },
+        {
+            "step": "Select parser",
+            "status": "done",
+            "message": f"Used {parser_used}; fallback reason: {parser_error}" if parser_error else f"Used {parser_used}.",
+        },
+        {
+            "step": "Validate input",
+            "status": "done",
+            "message": "Every job has arrival time, processing time, due date, and priority; every machine has availability.",
+        },
+        {
+            "step": "Run dispatching rules",
+            "status": "done",
+            "message": f"Compared {', '.join(request['rules'])} using the same transparent machine-assignment logic.",
+        },
+        {
+            "step": "Compare objectives",
+            "status": "done",
+            "message": f"{best_rule} ranked first with total lateness {best.total_lateness}, makespan {best.makespan}, and {best.late_jobs} late jobs.",
+        },
+        {
+            "step": "Inspect schedule structure",
+            "status": "done",
+            "message": diagnostics["headline"],
+        },
+        {
+            "step": "Prepare recommendation",
+            "status": "done",
+            "message": "Generated a natural-language recommendation, comparison table, Gantt chart, and downloadable artifacts.",
+        },
+    ]
+    return trace
+
+
+def build_diagnostics(best_schedule: pd.DataFrame, summary: pd.DataFrame, best_rule: str) -> dict[str, Any]:
+    makespan = int(best_schedule["finish_time"].max())
+    machine_rows = []
+    idle_gaps = []
+
+    for machine_id, group in best_schedule.sort_values(["machine_id", "start_time"]).groupby("machine_id"):
+        group = group.sort_values(["start_time", "finish_time"])
+        busy_time = int(group["processing_time"].sum())
+        first_start = int(group["start_time"].min())
+        last_finish = int(group["finish_time"].max())
+        idle_time = makespan - busy_time
+        previous_finish = 0
+        machine_gaps = []
+
+        for row in group.itertuples(index=False):
+            start = int(row.start_time)
+            if start > previous_finish:
+                gap = {"machine_id": machine_id, "from": previous_finish, "to": start, "duration": start - previous_finish}
+                idle_gaps.append(gap)
+                machine_gaps.append(gap)
+            previous_finish = int(row.finish_time)
+
+        if previous_finish < makespan:
+            gap = {
+                "machine_id": machine_id,
+                "from": previous_finish,
+                "to": makespan,
+                "duration": makespan - previous_finish,
+            }
+            idle_gaps.append(gap)
+            machine_gaps.append(gap)
+
+        machine_rows.append(
+            {
+                "machine_id": machine_id,
+                "jobs": int(len(group)),
+                "busy_time": busy_time,
+                "idle_time": idle_time,
+                "first_start": first_start,
+                "last_finish": last_finish,
+                "utilization": round(busy_time / makespan, 3) if makespan else 0,
+                "job_sequence": " -> ".join(group["job_id"].astype(str).tolist()),
+                "idle_gap_count": len(machine_gaps),
+            }
+        )
+
+    machine_diagnostics = pd.DataFrame(machine_rows).sort_values(["busy_time", "machine_id"], ascending=[False, True])
+    busiest = machine_diagnostics.iloc[0].to_dict()
+    most_idle = machine_diagnostics.sort_values(["idle_time", "machine_id"], ascending=[False, True]).iloc[0].to_dict()
+    late_jobs = best_schedule[best_schedule["is_late"]].sort_values(["lateness", "finish_time"], ascending=[False, True])
+    longest_flow = best_schedule.sort_values(["flow_time", "finish_time"], ascending=[False, True]).head(3)
+    top_gaps = sorted(idle_gaps, key=lambda gap: (-gap["duration"], gap["machine_id"], gap["from"]))[:5]
+
+    if late_jobs.empty:
+        headline = (
+            f"The {best_rule} Gantt chart has no late jobs; the busiest machine is {busiest['machine_id']} "
+            f"with {busiest['busy_time']} busy time units."
+        )
+    else:
+        headline = (
+            f"The {best_rule} Gantt chart shows {len(late_jobs)} late job(s); "
+            f"largest lateness is {int(late_jobs.iloc[0]['lateness'])}."
+        )
+
+    return {
+        "best_rule": best_rule,
+        "makespan": makespan,
+        "headline": headline,
+        "machine_diagnostics": machine_diagnostics.to_dict(orient="records"),
+        "busiest_machine": busiest,
+        "most_idle_machine": most_idle,
+        "top_idle_gaps": top_gaps,
+        "late_jobs": late_jobs[
+            ["job_id", "machine_id", "finish_time", "due_date", "lateness", "priority"]
+        ].to_dict(orient="records"),
+        "longest_flow_jobs": longest_flow[
+            ["job_id", "machine_id", "arrival_time", "finish_time", "flow_time", "due_date", "priority"]
+        ].to_dict(orient="records"),
+        "rule_ranking": summary.to_dict(orient="records"),
+    }
+
+
+def deterministic_summary(summary: pd.DataFrame, objective: str, diagnostics: dict[str, Any] | None = None) -> str:
     best = summary.iloc[0]
     lines = [
         "# Natural Language Summary",
@@ -326,6 +457,32 @@ def deterministic_summary(summary: pd.DataFrame, objective: str) -> str:
         [
             "",
             "Visualization: the app displays a Gantt chart for the recommended rule below the comparison table. Use it to inspect machine assignment, job order, idle time, and whether any jobs are late.",
+        ]
+    )
+    if diagnostics:
+        lines.extend(
+            [
+                "",
+                "Machine-level observations:",
+            ]
+        )
+        for row in diagnostics["machine_diagnostics"]:
+            lines.append(
+                f"- {row['machine_id']}: jobs {row['job_sequence']}; busy time {row['busy_time']}; "
+                f"idle time {row['idle_time']}; utilization {row['utilization']}."
+            )
+        lines.extend(
+            [
+                "",
+                "Next experiments:",
+                "- Test tighter due dates to see when FCFS stops dominating.",
+                "- Add setup times, machine eligibility, or weighted priority penalties.",
+                "- Compare total lateness against priority-weighted lateness.",
+            ]
+        )
+
+    lines.extend(
+        [
             "",
             "This is a transparent rule-based recommendation. It should be treated as a baseline experiment, not a final production scheduler.",
         ]
@@ -333,18 +490,43 @@ def deterministic_summary(summary: pd.DataFrame, objective: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def ask_ollama_for_summary(summary: pd.DataFrame, report_text: str, model: str, ollama_url: str) -> str:
+def ask_ollama_for_summary(
+    summary: pd.DataFrame,
+    report_text: str,
+    diagnostics: dict[str, Any],
+    agent_trace: list[dict[str, str]],
+    model: str,
+    ollama_url: str,
+) -> str:
     prompt = f"""
 You are a local scheduling research assistant.
 
-Explain this scheduling run in concise markdown for a collaborator demo.
-Focus on the recommended rule, trade-offs, and limitations.
+Write a detailed but readable scheduling-agent report in markdown.
+Use the provided trace, diagnostics, and metrics as evidence.
 Do not claim this is a real factory scheduler.
 The app displays a Gantt chart for the recommended rule below the comparison table.
 Do not say that Gantt charts or visualizations are not included.
+Do not reveal hidden chain-of-thought. Present an auditable reasoning trace,
+assumptions, evidence, and recommendations.
+
+Required sections:
+1. Executive recommendation
+2. Agent trace summary
+3. Evidence from metrics
+4. Gantt chart and machine observations
+5. Rule trade-offs
+6. Limitations
+7. Next experiments
+8. Clarifying questions for a real deployment
 
 Summary:
 {summary.to_csv(index=False)}
+
+Agent trace:
+{json.dumps(agent_trace, indent=2)}
+
+Diagnostics:
+{json.dumps(diagnostics, indent=2)}
 
 Report:
 {report_text}
@@ -355,20 +537,43 @@ Report:
     return response.json().get("response", "").strip() + "\n"
 
 
-def build_summary_prompt(summary: pd.DataFrame, report_text: str) -> str:
+def build_summary_prompt(
+    summary: pd.DataFrame,
+    report_text: str,
+    diagnostics: dict[str, Any],
+    agent_trace: list[dict[str, str]],
+) -> str:
     return f"""
 You are a scheduling research assistant.
 
-Explain this scheduling run in concise markdown for a collaborator demo.
-Focus on the recommended rule, trade-offs, and limitations.
+Write a detailed but readable scheduling-agent report in markdown.
+Use the provided trace, diagnostics, and metrics as evidence.
 Do not claim this is a real factory scheduler.
 The app displays a Gantt chart for the recommended rule below the comparison table.
 Do not say that Gantt charts or visualizations are not included.
 If you mention the Gantt chart, explain that it shows machine assignment over time,
 job order, idle gaps, and late jobs if any appear.
+Do not reveal hidden chain-of-thought. Present an auditable reasoning trace,
+assumptions, evidence, and recommendations.
+
+Required sections:
+1. Executive recommendation
+2. Agent trace summary
+3. Evidence from metrics
+4. Gantt chart and machine observations
+5. Rule trade-offs
+6. Limitations
+7. Next experiments
+8. Clarifying questions for a real deployment
 
 Summary:
 {summary.to_csv(index=False)}
+
+Agent trace:
+{json.dumps(agent_trace, indent=2)}
+
+Diagnostics:
+{json.dumps(diagnostics, indent=2)}
 
 Report:
 {report_text}
@@ -378,6 +583,8 @@ Report:
 def ask_openai_for_summary(
     summary: pd.DataFrame,
     report_text: str,
+    diagnostics: dict[str, Any],
+    agent_trace: list[dict[str, str]],
     model: str,
     api_key: str,
     responses_url: str = OPENAI_RESPONSES_URL,
@@ -393,7 +600,8 @@ def ask_openai_for_summary(
         },
         json={
             "model": model,
-            "input": build_summary_prompt(summary, report_text),
+            "input": build_summary_prompt(summary, report_text, diagnostics, agent_trace),
+            "max_output_tokens": 2200,
         },
         timeout=120,
     )
@@ -490,27 +698,34 @@ def run_agent_text(
     report_path = run_dir / "comparison_report.md"
     write_agent_report(summary, best_rule, chart_path, report_path)
 
+    diagnostics = build_diagnostics(best_schedule, summary, best_rule)
+    agent_trace = build_agent_trace(request, parser_used, parser_error, summary, best_rule, diagnostics)
+    (run_dir / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2) + "\n", encoding="utf-8")
+    (run_dir / "agent_trace.json").write_text(json.dumps(agent_trace, indent=2) + "\n", encoding="utf-8")
+
     report_text = report_path.read_text(encoding="utf-8")
     if provider == "openai":
         try:
             nl_summary = ask_openai_for_summary(
                 summary=summary,
                 report_text=report_text,
+                diagnostics=diagnostics,
+                agent_trace=agent_trace,
                 model=openai_model,
                 api_key=openai_api_key or os.environ.get("OPENAI_API_KEY", ""),
                 responses_url=openai_responses_url,
             )
         except Exception as exc:
-            nl_summary = deterministic_summary(summary, request["objective"])
+            nl_summary = deterministic_summary(summary, request["objective"], diagnostics)
             nl_summary += f"\n_OpenAI summary unavailable: `{exc}`._\n"
     elif provider == "ollama":
         try:
-            nl_summary = ask_ollama_for_summary(summary, report_text, model, ollama_url)
+            nl_summary = ask_ollama_for_summary(summary, report_text, diagnostics, agent_trace, model, ollama_url)
         except Exception as exc:
-            nl_summary = deterministic_summary(summary, request["objective"])
+            nl_summary = deterministic_summary(summary, request["objective"], diagnostics)
             nl_summary += f"\n_Ollama summary unavailable: `{exc}`._\n"
     else:
-        nl_summary = deterministic_summary(summary, request["objective"])
+        nl_summary = deterministic_summary(summary, request["objective"], diagnostics)
     (run_dir / "nl_summary.md").write_text(nl_summary, encoding="utf-8")
 
     print(f"Parsed {len(jobs)} jobs and {len(machines)} machines.")
@@ -534,6 +749,10 @@ def run_agent_text(
         "parser_used": parser_used,
         "parser_error": parser_error,
         "provider": provider,
+        "diagnostics": diagnostics,
+        "agent_trace": agent_trace,
+        "diagnostics_path": run_dir / "diagnostics.json",
+        "agent_trace_path": run_dir / "agent_trace.json",
     }
 
 

@@ -81,6 +81,8 @@ python scripts/05_agent_run_request.py examples/demo_request.txt
 
 Each run writes outputs under `outputs/agent_runs/`, including the original request, parsed JSON, job and machine CSVs, schedule CSVs, an Excel comparison workbook, a markdown comparison report, a Gantt chart, and a natural-language summary.
 
+The Streamlit app also displays an auditable agent trace and schedule diagnostics. These show the steps the assistant took, key assumptions, machine-level workload, idle gaps, longest-flow jobs, and recommended next experiments. This is visible reasoning evidence, not hidden chain-of-thought.
+
 ## Streamlit Cloud Deployment
 
 This repo is prepared for Streamlit Community Cloud:
