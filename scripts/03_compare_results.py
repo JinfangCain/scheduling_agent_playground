@@ -18,7 +18,7 @@ def summarize_schedule(schedule: pd.DataFrame) -> dict:
     machine_count = schedule["machine_id"].nunique()
     utilization = total_processing / (makespan * machine_count) if makespan else 0
 
-    return {
+    summary = {
         "rule": rule,
         "jobs": len(schedule),
         "machines_used": machine_count,
@@ -30,6 +30,10 @@ def summarize_schedule(schedule: pd.DataFrame) -> dict:
         "late_jobs": int(schedule["is_late"].sum()),
         "machine_utilization": round(utilization, 3),
     }
+    if "weighted_lateness" in schedule.columns:
+        summary["total_weighted_lateness"] = int(schedule["weighted_lateness"].sum())
+        summary["average_weighted_lateness"] = round(float(schedule["weighted_lateness"].mean()), 2)
+    return summary
 
 
 def write_svg_gantt_chart(schedule: pd.DataFrame, out_path: Path) -> None:
@@ -156,7 +160,9 @@ def main() -> None:
 
     schedules = [pd.read_csv(path) for path in schedule_paths]
     summary = pd.DataFrame([summarize_schedule(schedule) for schedule in schedules])
-    summary = summary.sort_values(["total_lateness", "makespan", "average_flow_time", "rule"])
+    sort_columns = ["total_weighted_lateness", "total_lateness", "makespan", "average_flow_time", "rule"]
+    sort_columns = [column for column in sort_columns if column in summary.columns]
+    summary = summary.sort_values(sort_columns)
     best_rule = summary.iloc[0]["rule"]
 
     comparison_path = OUTPUT_DIR / "schedule_comparison.xlsx"

@@ -73,6 +73,12 @@ Deterministic demo without Ollama:
 python scripts/05_agent_run_request.py examples/demo_request.txt --no-ollama
 ```
 
+Constraint-aware deterministic demo:
+
+```bash
+python scripts/05_agent_run_request.py examples/constraint_request.txt --provider deterministic
+```
+
 Local Ollama-assisted demo:
 
 ```bash
@@ -82,6 +88,8 @@ python scripts/05_agent_run_request.py examples/demo_request.txt
 Each run writes outputs under `outputs/agent_runs/`, including the original request, parsed JSON, job and machine CSVs, schedule CSVs, an Excel comparison workbook, a markdown comparison report, a Gantt chart, and a natural-language summary.
 
 The Streamlit app also displays an auditable agent trace and schedule diagnostics. During a run, it streams visible progress steps such as parsing, validation, rule execution, metric comparison, schedule inspection, and explanation generation. These show the steps the assistant took, key assumptions, machine-level workload, idle gaps, longest-flow jobs, and recommended next experiments. This is visible reasoning evidence, not hidden chain-of-thought.
+
+The constraint-aware path supports optional job fields such as `eligible_machines`, `family`, and `weight`, plus optional machine downtime windows. When requested, `OPTIMIZER` adds a deterministic optimizer-style baseline for small scenarios and a heuristic fallback for larger scenarios.
 
 ## Streamlit Cloud Deployment
 

@@ -11,6 +11,7 @@ import streamlit as st
 
 BASE_DIR = Path(__file__).resolve().parent
 DEMO_REQUEST_PATH = BASE_DIR / "examples" / "demo_request.txt"
+CONSTRAINT_REQUEST_PATH = BASE_DIR / "examples" / "constraint_request.txt"
 AGENT_SCRIPT_PATH = BASE_DIR / "scripts" / "05_agent_run_request.py"
 
 
@@ -107,6 +108,12 @@ def trace_markdown(trace: list[dict[str, str]]) -> str:
     for item in trace:
         lines.append(f"- **{item['step']}**: {item['message']}")
     return "\n".join(lines)
+
+
+def ranking_objective_text(summary: pd.DataFrame) -> str:
+    if "total_weighted_lateness" in summary.columns:
+        return "weighted lateness, total lateness, then makespan"
+    return "total lateness, then makespan"
 
 
 def render_result(result: dict[str, Any]) -> None:
@@ -234,6 +241,8 @@ def main() -> None:
         st.divider()
         if st.button("Load Demo Request", width="stretch"):
             st.session_state.request_text = read_text(DEMO_REQUEST_PATH)
+        if st.button("Load Constraint Demo", width="stretch"):
+            st.session_state.request_text = read_text(CONSTRAINT_REQUEST_PATH)
         if st.button("Clear Chat", width="stretch"):
             st.session_state.messages = []
             st.session_state.last_result = None
@@ -289,7 +298,7 @@ def main() -> None:
                 reply = (
                     f"I parsed {len(result['jobs'])} jobs and {len(result['machines'])} machines, "
                     f"compared {', '.join(result['request']['rules'])}, and recommend "
-                    f"**{result['best_rule']}** by total lateness, then makespan. "
+                    f"**{result['best_rule']}** by {ranking_objective_text(result['summary'])}. "
                     f"Results were saved to `{display_path(Path(result['run_dir']))}`."
                     f"{trace_markdown(result.get('agent_trace', []))}"
                 )

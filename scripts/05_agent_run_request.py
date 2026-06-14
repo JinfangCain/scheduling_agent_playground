@@ -20,7 +20,7 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "llama3.1:8b"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 OPENAI_MODEL = "gpt-4.1-mini"
-KNOWN_RULES = ["FCFS", "SPT", "EDD", "PRIORITY"]
+KNOWN_RULES = ["FCFS", "SPT", "EDD", "PRIORITY", "OPTIMIZER"]
 
 
 def load_module(path: Path, name: str) -> Any:
@@ -43,7 +43,14 @@ Extract a scheduling request from the text below.
 Return JSON only with this schema:
 {{
   "machines": [
-    {{"machine_id": "M01", "available_from": 0}}
+    {{
+      "machine_id": "M01",
+      "available_from": 0,
+      "capabilities": ["standard"],
+      "downtime_windows": [
+        {{"start": 10, "end": 14}}
+      ]
+    }}
   ],
   "jobs": [
     {{
@@ -51,16 +58,21 @@ Return JSON only with this schema:
       "arrival_time": 0,
       "processing_time": 5,
       "due_date": 14,
-      "priority": 2
+      "priority": 2,
+      "weight": 2,
+      "family": "A",
+      "eligible_machines": ["M01", "M03"]
     }}
   ],
-  "rules": ["FCFS", "SPT", "EDD", "PRIORITY"],
+  "rules": ["FCFS", "SPT", "EDD", "PRIORITY", "OPTIMIZER"],
   "objective": "minimize total lateness"
 }}
 
 Use only values explicitly present in the request. If the request gives a
 machine count and says all machines are available at time 0, create machine ids
 M01, M02, and so on. Do not invent jobs.
+If job eligibility, machine capabilities, downtime windows, weights, or product
+families are not present, omit those optional fields.
 
 Request:
 {request_text}
@@ -138,24 +150,53 @@ def fallback_parse_request(request_text: str) -> dict[str, Any]:
     machine_match = re.search(r"(\d+)\s+machines?\b", request_text, re.IGNORECASE)
     machine_count = int(machine_match.group(1)) if machine_match else 1
 
+    machine_pattern = re.compile(r"\bM\d+\b", re.IGNORECASE)
     jobs = []
-    job_pattern = re.compile(
-        r"Job\s+([A-Za-z0-9_-]+)\s+arrives?\s+at\s+(\d+)"
-        r".*?processing\s+time\s+(\d+)"
-        r".*?due\s+date\s+(\d+)"
-        r".*?priority\s+(\d+)",
+    job_pattern = re.compile(r"Job\s+([A-Za-z0-9_-]+).*?(?=(?:\n\s*Job\s+|\Z))", re.IGNORECASE | re.DOTALL)
+    for job_block in job_pattern.finditer(request_text):
+        block = " ".join(job_block.group(0).split())
+        detail = re.search(
+            r"Job\s+([A-Za-z0-9_-]+)\s+arrives?\s+at\s+(\d+)"
+            r".*?processing\s+time\s+(\d+)"
+            r".*?due\s+date\s+(\d+)"
+            r".*?priority\s+(\d+)",
+            block,
+            re.IGNORECASE,
+        )
+        if not detail:
+            continue
+        job = {
+            "job_id": detail.group(1),
+            "arrival_time": int(detail.group(2)),
+            "processing_time": int(detail.group(3)),
+            "due_date": int(detail.group(4)),
+            "priority": int(detail.group(5)),
+        }
+        weight_match = re.search(r"\bweight\s+(\d+)", block, re.IGNORECASE)
+        if weight_match:
+            job["weight"] = int(weight_match.group(1))
+        family_match = re.search(r"\bfamily\s+([A-Za-z0-9_-]+)", block, re.IGNORECASE)
+        if family_match:
+            job["family"] = family_match.group(1)
+        eligibility_match = re.search(
+            r"(?:eligible machines?|can only run on|only on)\s+([A-Za-z0-9_,\s/]+)",
+            block,
+            re.IGNORECASE,
+        )
+        if eligibility_match:
+            eligible = sorted({machine.upper() for machine in machine_pattern.findall(eligibility_match.group(1))})
+            if eligible:
+                job["eligible_machines"] = eligible
+        jobs.append(job)
+
+    downtime_by_machine: dict[str, list[dict[str, int]]] = {}
+    downtime_pattern = re.compile(
+        r"\b(M\d+)\b\s+(?:is\s+)?(?:unavailable|down|offline)\s+from\s+(\d+)\s+to\s+(\d+)",
         re.IGNORECASE,
     )
-    for match in job_pattern.finditer(request_text):
-        jobs.append(
-            {
-                "job_id": match.group(1),
-                "arrival_time": int(match.group(2)),
-                "processing_time": int(match.group(3)),
-                "due_date": int(match.group(4)),
-                "priority": int(match.group(5)),
-            }
-        )
+    for match in downtime_pattern.finditer(request_text):
+        machine_id = match.group(1).upper()
+        downtime_by_machine.setdefault(machine_id, []).append({"start": int(match.group(2)), "end": int(match.group(3))})
 
     upper_text = request_text.upper()
     rules = [rule for rule in KNOWN_RULES if rule in upper_text]
@@ -164,7 +205,11 @@ def fallback_parse_request(request_text: str) -> dict[str, Any]:
 
     return {
         "machines": [
-            {"machine_id": f"M{i:02d}", "available_from": 0}
+            {
+                "machine_id": f"M{i:02d}",
+                "available_from": 0,
+                "downtime_windows": downtime_by_machine.get(f"M{i:02d}", []),
+            }
             for i in range(1, machine_count + 1)
         ],
         "jobs": jobs,
@@ -189,6 +234,8 @@ def normalize_and_validate(parsed: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(machines, list) or not machines:
         raise ValueError("No machines were found in the request.")
 
+    machine_ids = {str(machine.get("machine_id")) for machine in machines if isinstance(machine, dict)}
+
     clean_jobs = []
     seen_jobs = set()
     for job in jobs:
@@ -209,15 +256,34 @@ def normalize_and_validate(parsed: dict[str, Any]) -> dict[str, Any]:
         if processing_time <= 0:
             raise ValueError(f"{job_id} has non-positive processing_time.")
 
-        clean_jobs.append(
-            {
-                "job_id": job_id,
-                "arrival_time": arrival_time,
-                "processing_time": processing_time,
-                "due_date": due_date,
-                "priority": priority,
-            }
-        )
+        clean_job = {
+            "job_id": job_id,
+            "arrival_time": arrival_time,
+            "processing_time": processing_time,
+            "due_date": due_date,
+            "priority": priority,
+        }
+        if "weight" in job:
+            clean_job["weight"] = int(job["weight"])
+        if "family" in job:
+            clean_job["family"] = str(job["family"])
+        if "eligible_machines" in job:
+            eligible = job["eligible_machines"]
+            if isinstance(eligible, str):
+                eligible = [part.strip() for part in re.split(r"[,/]", eligible) if part.strip()]
+            eligible = [str(machine_id) for machine_id in eligible]
+            unknown = sorted(set(eligible) - machine_ids)
+            if unknown:
+                raise ValueError(f"{job_id} references unknown eligible machines: {unknown}")
+            if not eligible:
+                raise ValueError(f"{job_id} has no eligible machines.")
+            clean_job["eligible_machines"] = eligible
+
+        clean_jobs.append(clean_job)
+
+    if any("weight" in job for job in clean_jobs):
+        for job in clean_jobs:
+            job.setdefault("weight", max(1, int(job["priority"])))
 
     clean_machines = []
     seen_machines = set()
@@ -232,7 +298,24 @@ def normalize_and_validate(parsed: dict[str, Any]) -> dict[str, Any]:
         available_from = int(machine["available_from"])
         if available_from < 0:
             raise ValueError(f"{machine_id} has negative available_from.")
-        clean_machines.append({"machine_id": machine_id, "available_from": available_from})
+        downtime_windows = []
+        for window in machine.get("downtime_windows", []) or []:
+            start = int(window.get("start", window.get("from", 0)))
+            end = int(window.get("end", window.get("to", start)))
+            if end <= start:
+                raise ValueError(f"{machine_id} has invalid downtime window {window}.")
+            downtime_windows.append({"start": start, "end": end})
+        clean_machine = {
+            "machine_id": machine_id,
+            "available_from": available_from,
+            "downtime_windows": downtime_windows,
+        }
+        if "capabilities" in machine:
+            capabilities = machine["capabilities"]
+            if isinstance(capabilities, str):
+                capabilities = [part.strip() for part in re.split(r"[,/]", capabilities) if part.strip()]
+            clean_machine["capabilities"] = [str(capability) for capability in capabilities]
+        clean_machines.append(clean_machine)
 
     clean_rules = []
     for rule in rules:
@@ -268,24 +351,37 @@ def write_agent_report(summary: pd.DataFrame, best_rule: str, chart_path: str, o
     except ValueError:
         chart_display_path = str(chart_path)
 
+    has_weighted = "total_weighted_lateness" in summary.columns
+    header = "| Rule | Makespan | Avg Flow | Total Lateness | Late Jobs | Utilization |"
+    separator = "| --- | ---: | ---: | ---: | ---: | ---: |"
+    if has_weighted:
+        header = "| Rule | Makespan | Avg Flow | Total Lateness | Weighted Lateness | Late Jobs | Utilization |"
+        separator = "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"
+
     lines = [
         "# Agent Scheduling Comparison Report",
         "",
         "Natural-language scheduling request converted into a transparent rule-based scheduling experiment.",
         "",
-        f"Best rule by total lateness, then makespan: **{best_rule}**.",
+        f"Best rule by {ranking_objective_text(summary)}: **{best_rule}**.",
         "",
         "## Summary Table",
         "",
-        "| Rule | Makespan | Avg Flow | Total Lateness | Late Jobs | Utilization |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
+        header,
+        separator,
     ]
 
     for row in summary.itertuples(index=False):
-        lines.append(
-            f"| {row.rule} | {row.makespan} | {row.average_flow_time} | "
-            f"{row.total_lateness} | {row.late_jobs} | {row.machine_utilization} |"
-        )
+        if has_weighted:
+            lines.append(
+                f"| {row.rule} | {row.makespan} | {row.average_flow_time} | "
+                f"{row.total_lateness} | {row.total_weighted_lateness} | {row.late_jobs} | {row.machine_utilization} |"
+            )
+        else:
+            lines.append(
+                f"| {row.rule} | {row.makespan} | {row.average_flow_time} | "
+                f"{row.total_lateness} | {row.late_jobs} | {row.machine_utilization} |"
+            )
 
     lines.extend(
         [
@@ -293,7 +389,7 @@ def write_agent_report(summary: pd.DataFrame, best_rule: str, chart_path: str, o
             "## Notes",
             "",
             "- The LLM, when available, is used only to parse and explain the request.",
-            "- Scheduling decisions are made by explicit dispatching rules.",
+            "- Scheduling decisions are made by explicit dispatching rules plus a deterministic optimizer baseline when requested.",
             f"- Gantt chart: `{chart_display_path}`.",
         ]
     )
@@ -309,6 +405,7 @@ def build_agent_trace(
     diagnostics: dict[str, Any],
 ) -> list[dict[str, str]]:
     best = summary.iloc[0]
+    objective_text = ranking_objective_text(summary)
     trace = [
         {
             "step": "Understand request",
@@ -333,7 +430,7 @@ def build_agent_trace(
         {
             "step": "Compare objectives",
             "status": "done",
-            "message": f"{best_rule} ranked first with total lateness {best.total_lateness}, makespan {best.makespan}, and {best.late_jobs} late jobs.",
+            "message": f"{best_rule} ranked first by {objective_text}; total lateness {best.total_lateness}, makespan {best.makespan}, and {best.late_jobs} late jobs.",
         },
         {
             "step": "Inspect schedule structure",
@@ -347,6 +444,12 @@ def build_agent_trace(
         },
     ]
     return trace
+
+
+def ranking_objective_text(summary: pd.DataFrame) -> str:
+    if "total_weighted_lateness" in summary.columns:
+        return "weighted lateness, total lateness, then makespan"
+    return "total lateness, then makespan"
 
 
 def build_diagnostics(best_schedule: pd.DataFrame, summary: pd.DataFrame, best_rule: str) -> dict[str, Any]:
@@ -433,6 +536,9 @@ def build_diagnostics(best_schedule: pd.DataFrame, summary: pd.DataFrame, best_r
 
 def deterministic_summary(summary: pd.DataFrame, objective: str, diagnostics: dict[str, Any] | None = None) -> str:
     best = summary.iloc[0]
+    weighted_text = ""
+    if "total_weighted_lateness" in summary.columns:
+        weighted_text = f", weighted lateness {best.total_weighted_lateness}"
     lines = [
         "# Natural Language Summary",
         "",
@@ -440,16 +546,19 @@ def deterministic_summary(summary: pd.DataFrame, objective: str, diagnostics: di
         "",
         f"The recommended rule is **{best.rule}** for the objective: {objective}.",
         "",
-        f"{best.rule} had total lateness {best.total_lateness}, makespan {best.makespan}, "
+        f"{best.rule} had total lateness {best.total_lateness}{weighted_text}, makespan {best.makespan}, "
         f"average flow time {best.average_flow_time}, and {best.late_jobs} late jobs.",
         "",
         "Trade-off notes:",
     ]
 
     for row in summary.itertuples(index=False):
+        weighted_part = ""
+        if "total_weighted_lateness" in summary.columns:
+            weighted_part = f", weighted lateness {row.total_weighted_lateness}"
         lines.append(
             f"- {row.rule}: makespan {row.makespan}, average flow {row.average_flow_time}, "
-            f"total lateness {row.total_lateness}, late jobs {row.late_jobs}, "
+            f"total lateness {row.total_lateness}{weighted_part}, late jobs {row.late_jobs}, "
             f"utilization {row.machine_utilization}."
         )
 
@@ -476,7 +585,7 @@ def deterministic_summary(summary: pd.DataFrame, objective: str, diagnostics: di
                 "",
                 "Next experiments:",
                 "- Test tighter due dates to see when FCFS stops dominating.",
-                "- Add setup times, machine eligibility, or weighted priority penalties.",
+                "- Add setup times, machine eligibility, downtime calendars, or weighted priority penalties.",
                 "- Compare total lateness against priority-weighted lateness.",
             ]
         )
@@ -702,9 +811,11 @@ def run_agent_text(
         emit("Run dispatching rules", f"Finished {rule}.")
 
     summary = pd.DataFrame([compare.summarize_schedule(schedule) for schedule in schedules])
-    summary = summary.sort_values(["total_lateness", "makespan", "average_flow_time", "rule"])
+    sort_columns = ["total_weighted_lateness", "total_lateness", "makespan", "average_flow_time", "rule"]
+    sort_columns = [column for column in sort_columns if column in summary.columns]
+    summary = summary.sort_values(sort_columns)
     best_rule = summary.iloc[0]["rule"]
-    emit("Compare objectives", f"{best_rule} is leading by total lateness, then makespan.")
+    emit("Compare objectives", f"{best_rule} is leading by {ranking_objective_text(summary)}.")
 
     comparison_path = run_dir / "schedule_comparison.xlsx"
     with pd.ExcelWriter(comparison_path, engine="openpyxl") as writer:
@@ -762,7 +873,7 @@ def run_agent_text(
     if parser_error:
         print(f"Parser fallback reason: {parser_error}")
     print(f"Compared {', '.join(request['rules'])}.")
-    print(f"Best rule by total lateness, then makespan: {best_rule}.")
+    print(f"Best rule by {ranking_objective_text(summary)}: {best_rule}.")
     print(f"Wrote {run_dir}")
     return {
         "run_dir": run_dir,
